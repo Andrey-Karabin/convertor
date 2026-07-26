@@ -1,3 +1,4 @@
+№ macOS
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -8,3 +9,13 @@
 .fseventsd
 .DocumentRevisions-V100
 *.icloud
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local config and runtime data
+.env
+tmp/
+*.log

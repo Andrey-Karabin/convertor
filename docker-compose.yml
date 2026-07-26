@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - convertor-work:/tmp/convertor
+
+volumes:
+  convertor-work:
