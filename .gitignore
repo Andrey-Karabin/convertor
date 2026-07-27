@@ -19,3 +19,7 @@ __pycache__/
 .env
 tmp/
 *.log
+
+# Optional local fonts for better Office document rendering
+fonts/*
+!fonts/.gitkeep
