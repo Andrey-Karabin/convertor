@@ -35,6 +35,7 @@ RUN apt-get update \
         qpdf \
         tesseract-ocr \
         tesseract-ocr-osd \
+        unar \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 

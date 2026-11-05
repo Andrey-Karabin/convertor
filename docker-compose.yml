@@ -31,6 +31,32 @@ services:
       - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
       - ./fonts:/usr/local/share/fonts/custom:ro
 
+  web:
+    build: .
+    profiles:
+      - web
+    command:
+      - streamlit
+      - run
+      - streamlit_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.maxUploadSize=${STREAMLIT_MAX_UPLOAD_MB:-500}
+    cpus: ${DOCKER_CPUS:-12}
+    env_file:
+      - .env
+    environment:
+      OMP_NUM_THREADS: ${DOCKER_CPUS:-12}
+      OPENBLAS_NUM_THREADS: ${DOCKER_CPUS:-12}
+      MKL_NUM_THREADS: ${DOCKER_CPUS:-12}
+      NUMEXPR_NUM_THREADS: ${DOCKER_CPUS:-12}
+    restart: unless-stopped
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    volumes:
+      - convertor-work:/tmp/convertor
+      - ./fonts:/usr/local/share/fonts/custom:ro
+
 volumes:
   convertor-work:
   telegram-bot-api-data:

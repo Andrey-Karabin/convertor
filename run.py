@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -25,11 +26,15 @@ from aiogram.types import (
 from converter import (
     ConversionError,
     ConversionToolMissingError,
+    compress_image,
+    compress_pdf,
     convert_djvu_to_pdf,
     convert_image_to_pdf,
     convert_office_to_pdf,
     delete_pdf_pages,
+    extract_archive_to_files,
     extract_pdf_pages,
+    list_archive_files,
     merge_pdfs,
     split_pdf_to_pdf_parts,
     split_pdf_to_zip_parts,
@@ -55,7 +60,17 @@ DOCUMENT_EXTENSIONS = {
     ".xlsx",
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-SUPPORTED_EXTENSIONS = DJVU_EXTENSIONS | DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS
+ARCHIVE_EXTENSIONS = {
+    ".7z",
+    ".rar",
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tar.xz",
+}
+SUPPORTED_EXTENSIONS = DJVU_EXTENSIONS | DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS | ARCHIVE_EXTENSIONS
 
 DEFAULT_MAX_INPUT_MB = 200
 DEFAULT_MAX_OUTPUT_MB = 49
@@ -69,6 +84,10 @@ MAIN_BUTTON_PDF_TOOLS = "Интересные функции"
 ADMIN_CALLBACK_PREFIX = "admin:"
 
 CONVERT_CALLBACK_PREFIX = "convert_pdf:"
+COMPRESS_IMAGE_CALLBACK_PREFIX = "compress_image:"
+EXTRACT_ARCHIVE_CALLBACK_PREFIX = "extract_archive:"
+ARCHIVE_SELECT_CALLBACK_PREFIX = "archive_select:"
+ARCHIVE_PAGE_CALLBACK_PREFIX = "archive_page:"
 PDF_TOOL_CALLBACK_PREFIX = "pdf_tool:"
 PDF_FILE_CALLBACK_PREFIX = "pdf_file_tool:"
 ALBUM_CONVERT_CALLBACK_PREFIX = "album_convert:"
@@ -76,11 +95,16 @@ ALBUM_CONVERT_CALLBACK_PREFIX = "album_convert:"
 PDF_TOOL_MERGE = "merge"
 PDF_TOOL_SPLIT = "split"
 PDF_TOOL_DELETE = "delete"
+PDF_TOOL_COMPRESS = "compress"
 PDF_TOOL_MERGE_DONE = "merge_done"
 PDF_TOOL_SPLIT_ALL = "split_all"
 PDF_TOOL_CANCEL = "cancel"
 ALBUM_ACTION_INDIVIDUAL = "individual"
 ALBUM_ACTION_MERGE = "merge"
+ALBUM_ACTION_COMPRESS_IMAGES = "compress_images"
+ARCHIVE_ACTION_ALL = "all"
+ARCHIVE_ACTION_CHOOSE = "choose"
+ARCHIVE_PAGE_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -93,6 +117,11 @@ class Settings:
     admin_ids: set[int]
     weekly_limit_files: int
     weekly_limit_mb: int
+    image_compress_quality: int
+    image_compress_max_side: int
+    pdf_compress_quality: str
+    archive_max_output_mb: int
+    archive_max_files: int
     telegram_api_base: str | None
     telegram_api_is_local: bool
     telegram_request_timeout: float
@@ -138,9 +167,16 @@ class PdfToolSession:
     waiting_for_ranges: bool = False
 
 
+@dataclass(frozen=True)
+class ArchiveSelectionSession:
+    pending: PendingFile
+    entries: tuple[str, ...]
+
+
 pending_files: dict[str, PendingFile] = {}
 pending_pdf_uploads: dict[str, PendingPdfUpload] = {}
 album_conversion_sessions: dict[str, list[PendingFile]] = {}
+archive_selection_sessions: dict[str, ArchiveSelectionSession] = {}
 pdf_tool_sessions: dict[int, PdfToolSession] = {}
 merge_album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 pdf_upload_album_tasks: dict[tuple[int, str], asyncio.Task] = {}
@@ -180,6 +216,11 @@ def load_settings() -> Settings:
     admin_ids = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
     weekly_limit_files = int(os.getenv("WEEKLY_LIMIT_FILES", "0"))
     weekly_limit_mb = int(os.getenv("WEEKLY_LIMIT_MB", "0"))
+    image_compress_quality = int(os.getenv("IMAGE_COMPRESS_QUALITY", "75"))
+    image_compress_max_side = int(os.getenv("IMAGE_COMPRESS_MAX_SIDE", "1600"))
+    pdf_compress_quality = os.getenv("PDF_COMPRESS_QUALITY", "ebook")
+    archive_max_output_mb = int(os.getenv("ARCHIVE_MAX_OUTPUT_MB", "500"))
+    archive_max_files = int(os.getenv("ARCHIVE_MAX_FILES", "200"))
     telegram_api_base = os.getenv("TELEGRAM_API_BASE", "").strip() or None
     telegram_api_is_local = os.getenv("TELEGRAM_API_IS_LOCAL", "").strip().lower() in {
         "1",
@@ -198,6 +239,11 @@ def load_settings() -> Settings:
         admin_ids=admin_ids,
         weekly_limit_files=weekly_limit_files,
         weekly_limit_mb=weekly_limit_mb,
+        image_compress_quality=image_compress_quality,
+        image_compress_max_side=image_compress_max_side,
+        pdf_compress_quality=pdf_compress_quality,
+        archive_max_output_mb=archive_max_output_mb,
+        archive_max_files=archive_max_files,
         telegram_api_base=telegram_api_base,
         telegram_api_is_local=telegram_api_is_local,
         telegram_request_timeout=telegram_request_timeout,
@@ -258,10 +304,12 @@ def feature_description() -> str:
         "- XLS/XLSX/ODS/CSV -> PDF\n"
         "- PPT/PPTX/ODP -> PDF\n"
         "- JPG/PNG/WebP/BMP/TIFF -> PDF\n"
+        "- Сжатие фото и изображений\n"
+        "- Сжатие PDF\n"
+        "- Безопасная распаковка ZIP/TAR/7Z/RAR-архивов\n"
         "- Фото, отправленное прямо в чат -> PDF\n"
         "\n"
         "Просто отправь файл или фото, затем нажми кнопку конвертации. "
-        "OCR пока не используется, поэтому текст внутри сканов не распознается."
     )
 
 
@@ -271,41 +319,127 @@ def pdf_tools_description() -> str:
         "\n"
         "- Склеить несколько PDF в один файл\n"
         "- Разделить PDF на отдельные страницы или выбрать определенные в один файл\n"
-        "- Удалить выбранные страницы из PDF\n"        "\n"
+        "- Удалить выбранные страницы из PDF\n"
+        "- Сжать PDF\n"
+        "\n"
         "Выбери действие ниже."
     )
 
 
-def conversion_keyboard(job_id: str) -> InlineKeyboardMarkup:
+def conversion_keyboard(job_id: str, conversion_type: str | None = None) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="Конвертировать в PDF",
+                callback_data=f"{CONVERT_CALLBACK_PREFIX}{job_id}",
+            )
+        ]
+    ]
+    if conversion_type == "image":
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="Сжать фото",
+                    callback_data=f"{COMPRESS_IMAGE_CALLBACK_PREFIX}{job_id}",
+                )
+            ]
+        )
+    if conversion_type == "archive":
+        return archive_keyboard(job_id)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def archive_keyboard(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Конвертировать в PDF",
-                    callback_data=f"{CONVERT_CALLBACK_PREFIX}{job_id}",
+                    text="Разархивировать все файлы",
+                    callback_data=f"{EXTRACT_ARCHIVE_CALLBACK_PREFIX}{ARCHIVE_ACTION_ALL}:{job_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Выбрать файл из архива",
+                    callback_data=f"{EXTRACT_ARCHIVE_CALLBACK_PREFIX}{ARCHIVE_ACTION_CHOOSE}:{job_id}",
                 )
             ],
         ]
     )
 
 
-def album_conversion_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def archive_file_selection_keyboard(
+    session_id: str,
+    entries: tuple[str, ...],
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    page_count = max(1, (len(entries) + ARCHIVE_PAGE_SIZE - 1) // ARCHIVE_PAGE_SIZE)
+    page = min(max(0, page), page_count - 1)
+    start = page * ARCHIVE_PAGE_SIZE
+    visible_entries = entries[start:start + ARCHIVE_PAGE_SIZE]
+    buttons = []
+
+    for offset, entry_name in enumerate(visible_entries):
+        entry_index = start + offset
+        short_name = entry_name if len(entry_name) <= 48 else f"...{entry_name[-45:]}"
+        buttons.append(
             [
                 InlineKeyboardButton(
-                    text="Перевести каждый файл в PDF",
-                    callback_data=f"{ALBUM_CONVERT_CALLBACK_PREFIX}{ALBUM_ACTION_INDIVIDUAL}:{job_id}",
+                    text=short_name,
+                    callback_data=f"{ARCHIVE_SELECT_CALLBACK_PREFIX}{session_id}:{entry_index}",
                 )
-            ],
+            ]
+        )
+
+    navigation_buttons = []
+    if page > 0:
+        navigation_buttons.append(
+            InlineKeyboardButton(
+                text="Назад",
+                callback_data=f"{ARCHIVE_PAGE_CALLBACK_PREFIX}{session_id}:{page - 1}",
+            )
+        )
+    if page + 1 < page_count:
+        navigation_buttons.append(
+            InlineKeyboardButton(
+                text="Вперед",
+                callback_data=f"{ARCHIVE_PAGE_CALLBACK_PREFIX}{session_id}:{page + 1}",
+            )
+        )
+    if navigation_buttons:
+        buttons.append(navigation_buttons)
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def album_conversion_keyboard(
+    job_id: str,
+    allow_image_compression: bool = False,
+) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="Перевести каждый файл в PDF",
+                callback_data=f"{ALBUM_CONVERT_CALLBACK_PREFIX}{ALBUM_ACTION_INDIVIDUAL}:{job_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Перевести в PDF и склеить",
+                callback_data=f"{ALBUM_CONVERT_CALLBACK_PREFIX}{ALBUM_ACTION_MERGE}:{job_id}",
+            )
+        ],
+    ]
+    if allow_image_compression:
+        buttons.append(
             [
                 InlineKeyboardButton(
-                    text="Перевести в PDF и склеить",
-                    callback_data=f"{ALBUM_CONVERT_CALLBACK_PREFIX}{ALBUM_ACTION_MERGE}:{job_id}",
+                    text="Сжать фото и скачать ZIP",
+                    callback_data=f"{ALBUM_CONVERT_CALLBACK_PREFIX}{ALBUM_ACTION_COMPRESS_IMAGES}:{job_id}",
                 )
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def pdf_tools_keyboard() -> InlineKeyboardMarkup:
@@ -327,6 +461,12 @@ def pdf_tools_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Удалить страницы",
                     callback_data=f"{PDF_TOOL_CALLBACK_PREFIX}{PDF_TOOL_DELETE}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Сжать PDF",
+                    callback_data=f"{PDF_TOOL_CALLBACK_PREFIX}{PDF_TOOL_COMPRESS}",
                 )
             ],
         ]
@@ -352,6 +492,12 @@ def pdf_file_keyboard(job_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Удалить страницы",
                     callback_data=f"{PDF_FILE_CALLBACK_PREFIX}{PDF_TOOL_DELETE}:{job_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Сжать PDF",
+                    callback_data=f"{PDF_FILE_CALLBACK_PREFIX}{PDF_TOOL_COMPRESS}:{job_id}",
                 )
             ],
         ]
@@ -501,6 +647,9 @@ def admin_limits_text(settings: Settings) -> str:
         f"Админы: {admins}\n"
         f"Файлов в неделю: {file_limit}\n"
         f"МБ входящих файлов в неделю: {mb_limit}\n\n"
+        f"Сжатие фото: качество {settings.image_compress_quality}, max side {settings.image_compress_max_side}px\n"
+        f"Сжатие PDF: {settings.pdf_compress_quality}\n"
+        f"Распаковка архивов: до {settings.archive_max_output_mb} МБ и {settings.archive_max_files} файлов\n\n"
         "Админы не ограничиваются недельными лимитами."
     )
 
@@ -510,12 +659,24 @@ def get_conversion_type(file_name: str | None) -> str | None:
         return None
 
     extension = Path(file_name).suffix.lower()
+    if archive_extension(file_name) is not None:
+        return "archive"
     if extension in DJVU_EXTENSIONS:
         return "djvu"
     if extension in DOCUMENT_EXTENSIONS:
         return "office"
     if extension in IMAGE_EXTENSIONS:
         return "image"
+    return None
+
+
+def archive_extension(file_name: str | None) -> str | None:
+    if not file_name:
+        return None
+    lower_name = file_name.lower()
+    for extension in sorted(ARCHIVE_EXTENSIONS, key=len, reverse=True):
+        if lower_name.endswith(extension):
+            return extension
     return None
 
 
@@ -529,12 +690,32 @@ def safe_pdf_name(file_name: str) -> str:
     return f"{safe_stem(file_name)}.pdf"
 
 
+def safe_compressed_image_name(file_name: str) -> str:
+    return f"{safe_stem(file_name)}_compressed.jpg"
+
+
+def safe_compressed_pdf_name(file_name: str) -> str:
+    return f"{safe_stem(file_name)}_compressed.pdf"
+
+
+def archive_send_filename(path: Path, root_dir: Path) -> str:
+    try:
+        relative_name = path.relative_to(root_dir).as_posix()
+    except ValueError:
+        relative_name = path.name
+    filename = re.sub(r"[^\w.,()+=@ -]+", "__", relative_name).strip("._- ")
+    if len(filename) > 120:
+        suffix = Path(filename).suffix
+        filename = f"{filename[: max(1, 120 - len(suffix) - 3)]}...{suffix}"
+    return filename or path.name
+
+
 def is_pdf(file_name: str | None) -> bool:
     return bool(file_name and Path(file_name).suffix.lower() == ".pdf")
 
 
 def input_name(job_id: str, file_name: str) -> str:
-    extension = Path(file_name).suffix.lower()
+    extension = archive_extension(file_name) or Path(file_name).suffix.lower()
     if not extension:
         extension = ".bin"
     return f"input_{job_id}{extension}"
@@ -813,14 +994,32 @@ def record_conversion_metric(
     output_path: Path | None,
     status: str,
 ) -> None:
+    record_operation_metric(
+        usage_db,
+        pending.user_id,
+        pending.conversion_type,
+        pending.file_size,
+        output_path,
+        status,
+    )
+
+
+def record_operation_metric(
+    usage_db: BotDatabase,
+    user_id: int,
+    operation_type: str,
+    input_bytes: int | None,
+    output_path: Path | None,
+    status: str,
+) -> None:
     output_bytes = 0
     if output_path is not None and output_path.exists():
         output_bytes = output_path.stat().st_size
 
     usage_db.record_conversion(
-        pending.user_id,
-        pending.conversion_type,
-        pending.file_size,
+        user_id,
+        operation_type,
+        input_bytes,
         output_bytes,
         status,
     )
@@ -914,10 +1113,12 @@ async def send_conversion_album_summary(
         return
 
     job_id = uuid.uuid4().hex
-    album_conversion_sessions[job_id] = ordered_pending_files(files)
+    ordered_files = ordered_pending_files(files)
+    album_conversion_sessions[job_id] = ordered_files
+    allow_image_compression = all(file.conversion_type == "image" for file in ordered_files)
     await message.answer(
         f"Получил файлов: {len(files)}. Что сделать?",
-        reply_markup=album_conversion_keyboard(job_id),
+        reply_markup=album_conversion_keyboard(job_id, allow_image_compression),
     )
 
 
@@ -936,7 +1137,8 @@ def schedule_conversion_album_summary(
     )
 
 
-async def handle_start(message: Message) -> None:
+async def handle_start(message: Message, usage_db: BotDatabase) -> None:
+    touch_user_metrics(message, usage_db)
     await message.answer(
         "Привет! Отправь документ, DJVU-файл или фото, а я превращу его в PDF.",
         reply_markup=main_menu_keyboard(),
@@ -1026,7 +1228,7 @@ async def handle_document(
     user_id = message.from_user.id
     touch_user_metrics(message, usage_db)
     if is_pdf(document.file_name) and user_id in pdf_tool_sessions:
-        await handle_pdf_tool_document(message, bot, settings)
+        await handle_pdf_tool_document(message, bot, settings, usage_db)
         return
 
     if is_pdf(document.file_name):
@@ -1098,7 +1300,7 @@ async def handle_document(
         return
 
     file_name = document.file_name or "document"
-    if message.media_group_id:
+    if message.media_group_id and conversion_type != "archive":
         key = (user_id, message.media_group_id)
         conversion_albums.setdefault(key, []).append(
             PendingFile(
@@ -1127,7 +1329,7 @@ async def handle_document(
 
     await message.answer(
         "Выберите действие:",
-        reply_markup=conversion_keyboard(job_id),
+        reply_markup=conversion_keyboard(job_id, conversion_type),
     )
 
 
@@ -1193,7 +1395,7 @@ async def handle_photo(
 
     await message.answer(
         "Выберите действие:",
-        reply_markup=conversion_keyboard(job_id),
+        reply_markup=conversion_keyboard(job_id, "image"),
     )
 
 
@@ -1286,6 +1488,371 @@ async def handle_conversion(
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
+async def handle_image_compression(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
+    if callback.data is None or not callback.data.startswith(COMPRESS_IMAGE_CALLBACK_PREFIX):
+        return
+
+    job_id = callback.data.removeprefix(COMPRESS_IMAGE_CALLBACK_PREFIX)
+    pending = pending_files.pop(job_id, None)
+
+    if pending is None:
+        await callback.answer("Файл уже обработан или бот был перезапущен.", show_alert=True)
+        return
+
+    if callback.from_user.id != pending.user_id:
+        pending_files[job_id] = pending
+        await callback.answer(
+            "Эта кнопка относится к файлу другого пользователя.",
+            show_alert=True,
+        )
+        return
+
+    if pending.conversion_type != "image":
+        await callback.answer("Сжать можно только изображение.", show_alert=True)
+        return
+
+    if callback.message is None:
+        await callback.answer("Не удалось отправить результат в этот чат.", show_alert=True)
+        return
+
+    await callback.answer("Сжимаю фото...")
+
+    job_dir = settings.workdir / job_id
+    input_path = job_dir / input_name(job_id, pending.file_name)
+    output_name = safe_compressed_image_name(pending.file_name)
+    output_path = job_dir / output_name
+
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        await callback.message.answer("Скачиваю фото...")
+        await download_telegram_file(bot, pending.file_id, input_path)
+        await callback.message.answer("Сжимаю фото...")
+        await compress_image(
+            input_path,
+            output_path,
+            settings.image_compress_quality,
+            settings.image_compress_max_side,
+        )
+        sent = await send_document_result(
+            callback.message,
+            output_path,
+            output_name,
+            f"Готово. Фото сжато: {file_size_mb(output_path):.1f} МБ.",
+            settings,
+        )
+        record_operation_metric(
+            usage_db,
+            pending.user_id,
+            "image_compress",
+            pending.file_size,
+            output_path,
+            "success" if sent else "failed",
+        )
+    except (ConversionToolMissingError, ConversionError) as exc:
+        record_operation_metric(
+            usage_db,
+            pending.user_id,
+            "image_compress",
+            pending.file_size,
+            output_path,
+            "failed",
+        )
+        await callback.message.answer(
+            f"Не удалось сжать фото: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        record_operation_metric(
+            usage_db,
+            pending.user_id,
+            "image_compress",
+            pending.file_size,
+            output_path,
+            "failed",
+        )
+        logging.exception("Unexpected image compression failure")
+        await callback.message.answer(
+            "Произошла неожиданная ошибка при сжатии фото.",
+            reply_markup=main_menu_keyboard(),
+        )
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def handle_archive_extraction(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
+    if callback.data is None or not callback.data.startswith(EXTRACT_ARCHIVE_CALLBACK_PREFIX):
+        return
+
+    payload = callback.data.removeprefix(EXTRACT_ARCHIVE_CALLBACK_PREFIX)
+    action, _, job_id = payload.partition(":")
+    if not job_id:
+        action = ARCHIVE_ACTION_ALL
+        job_id = payload
+    pending = pending_files.pop(job_id, None)
+
+    if pending is None:
+        await callback.answer("Файл уже обработан или бот был перезапущен.", show_alert=True)
+        return
+
+    if callback.from_user.id != pending.user_id:
+        pending_files[job_id] = pending
+        await callback.answer(
+            "Эта кнопка относится к файлу другого пользователя.",
+            show_alert=True,
+        )
+        return
+
+    if pending.conversion_type != "archive":
+        await callback.answer("Это не архив.", show_alert=True)
+        return
+
+    if callback.message is None:
+        await callback.answer("Не удалось отправить результат в этот чат.", show_alert=True)
+        return
+
+    if action not in {ARCHIVE_ACTION_ALL, ARCHIVE_ACTION_CHOOSE}:
+        pending_files[job_id] = pending
+        await callback.answer("Неизвестное действие.", show_alert=True)
+        return
+
+    await callback.answer("Работаю с архивом...")
+
+    job_dir = settings.workdir / job_id
+    input_path = job_dir / input_name(job_id, pending.file_name)
+    output_dir = job_dir / "extracted"
+    max_total_bytes = settings.archive_max_output_mb * 1024 * 1024
+
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        await callback.message.answer("Скачиваю архив...")
+        await download_telegram_file(bot, pending.file_id, input_path)
+
+        if action == ARCHIVE_ACTION_CHOOSE:
+            await callback.message.answer(
+                f"Читаю список файлов. Лимит: {settings.archive_max_output_mb} МБ и {settings.archive_max_files} файлов..."
+            )
+            entries = await list_archive_files(
+                input_path,
+                max_total_bytes,
+                settings.archive_max_files,
+            )
+            session_id = uuid.uuid4().hex[:16]
+            archive_selection_sessions[session_id] = ArchiveSelectionSession(
+                pending=pending,
+                entries=tuple(entry.name for entry in entries),
+            )
+            await callback.message.answer(
+                f"В архиве файлов: {len(entries)}. Выбери, какой файл отправить.",
+                reply_markup=archive_file_selection_keyboard(
+                    session_id,
+                    archive_selection_sessions[session_id].entries,
+                ),
+            )
+            return
+
+        await callback.message.answer(
+            f"Проверяю и разархивирую. Лимит: {settings.archive_max_output_mb} МБ и {settings.archive_max_files} файлов..."
+        )
+        extracted_paths, total_bytes = await extract_archive_to_files(
+            input_path,
+            output_dir,
+            max_total_bytes,
+            settings.archive_max_files,
+        )
+        await callback.message.answer(
+            (
+                f"Готово. Разархивировано файлов: {len(extracted_paths)}, "
+                f"объем внутри архива: {total_bytes / (1024 * 1024):.1f} МБ. "
+                "Отправляю файлы по одному."
+            ),
+            reply_markup=main_menu_keyboard(),
+        )
+        all_sent = True
+        for index, extracted_path in enumerate(extracted_paths, start=1):
+            sent = await send_document_result(
+                callback.message,
+                extracted_path,
+                archive_send_filename(extracted_path, output_dir),
+                f"Файл {index} из {len(extracted_paths)}",
+                settings,
+            )
+            all_sent = all_sent and sent
+
+        usage_db.record_conversion(
+            pending.user_id,
+            "archive_extract_all",
+            pending.file_size,
+            sum(path.stat().st_size for path in extracted_paths if path.exists()),
+            "success" if all_sent else "failed",
+        )
+    except (ConversionToolMissingError, ConversionError) as exc:
+        usage_db.record_conversion(
+            pending.user_id,
+            "archive_extract",
+            pending.file_size,
+            0,
+            "failed",
+        )
+        await callback.message.answer(
+            f"Не удалось разархивировать файл: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        usage_db.record_conversion(
+            pending.user_id,
+            "archive_extract",
+            pending.file_size,
+            0,
+            "failed",
+        )
+        logging.exception("Unexpected archive extraction failure")
+        await callback.message.answer(
+            "Произошла неожиданная ошибка при разархивировании.",
+            reply_markup=main_menu_keyboard(),
+        )
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def handle_archive_page(callback: CallbackQuery) -> None:
+    if callback.data is None or not callback.data.startswith(ARCHIVE_PAGE_CALLBACK_PREFIX):
+        return
+
+    payload = callback.data.removeprefix(ARCHIVE_PAGE_CALLBACK_PREFIX)
+    session_id, _, page_text = payload.partition(":")
+    session = archive_selection_sessions.get(session_id)
+    if session is None:
+        await callback.answer("Список файлов устарел. Пришли архив заново.", show_alert=True)
+        return
+
+    if callback.from_user.id != session.pending.user_id:
+        await callback.answer("Этот список относится к архиву другого пользователя.", show_alert=True)
+        return
+
+    try:
+        page = int(page_text)
+    except ValueError:
+        await callback.answer("Неизвестная страница.", show_alert=True)
+        return
+
+    await callback.answer()
+    if callback.message is not None:
+        await callback.message.edit_reply_markup(
+            reply_markup=archive_file_selection_keyboard(
+                session_id,
+                session.entries,
+                page,
+            )
+        )
+
+
+async def handle_archive_file_selection(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
+    if callback.data is None or not callback.data.startswith(ARCHIVE_SELECT_CALLBACK_PREFIX):
+        return
+
+    payload = callback.data.removeprefix(ARCHIVE_SELECT_CALLBACK_PREFIX)
+    session_id, _, index_text = payload.partition(":")
+    session = archive_selection_sessions.get(session_id)
+    if session is None:
+        await callback.answer("Список файлов устарел. Пришли архив заново.", show_alert=True)
+        return
+
+    pending = session.pending
+    if callback.from_user.id != pending.user_id:
+        await callback.answer("Эта кнопка относится к архиву другого пользователя.", show_alert=True)
+        return
+
+    try:
+        entry_index = int(index_text)
+        selected_name = session.entries[entry_index]
+    except (ValueError, IndexError):
+        await callback.answer("Неизвестный файл.", show_alert=True)
+        return
+
+    if callback.message is None:
+        await callback.answer("Не удалось отправить результат в этот чат.", show_alert=True)
+        return
+
+    archive_selection_sessions.pop(session_id, None)
+    await callback.answer("Достаю выбранный файл...")
+
+    job_id = uuid.uuid4().hex
+    job_dir = settings.workdir / job_id
+    input_path = job_dir / input_name(job_id, pending.file_name)
+    output_dir = job_dir / "selected"
+    max_total_bytes = settings.archive_max_output_mb * 1024 * 1024
+
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        await callback.message.answer("Скачиваю архив...")
+        await download_telegram_file(bot, pending.file_id, input_path)
+        await callback.message.answer(f"Достаю файл: {selected_name}")
+        extracted_paths, total_bytes = await extract_archive_to_files(
+            input_path,
+            output_dir,
+            max_total_bytes,
+            settings.archive_max_files,
+            selected_names={selected_name},
+        )
+        extracted_path = extracted_paths[0]
+        sent = await send_document_result(
+            callback.message,
+            extracted_path,
+            archive_send_filename(extracted_path, output_dir),
+            f"Готово. Файл из архива: {selected_name}",
+            settings,
+        )
+        usage_db.record_conversion(
+            pending.user_id,
+            "archive_extract_selected",
+            pending.file_size,
+            total_bytes,
+            "success" if sent else "failed",
+        )
+    except (ConversionToolMissingError, ConversionError) as exc:
+        usage_db.record_conversion(
+            pending.user_id,
+            "archive_extract_selected",
+            pending.file_size,
+            0,
+            "failed",
+        )
+        await callback.message.answer(
+            f"Не удалось достать выбранный файл: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception:
+        usage_db.record_conversion(
+            pending.user_id,
+            "archive_extract_selected",
+            pending.file_size,
+            0,
+            "failed",
+        )
+        logging.exception("Unexpected selected archive extraction failure")
+        await callback.message.answer(
+            "Произошла неожиданная ошибка при извлечении выбранного файла.",
+            reply_markup=main_menu_keyboard(),
+        )
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
 async def convert_pending_file_to_pdf(
     bot: Bot,
     pending: PendingFile,
@@ -1317,6 +1884,56 @@ async def convert_pending_file_to_pdf(
     return output_path, output_name
 
 
+async def compress_pending_image_to_jpg(
+    bot: Bot,
+    pending: PendingFile,
+    job_dir: Path,
+    index: int,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> tuple[Path, str]:
+    input_path = job_dir / f"{index}_{input_name(str(pending.sequence), pending.file_name)}"
+    output_name = f"{index}_{safe_compressed_image_name(pending.file_name)}"
+    output_path = job_dir / output_name
+
+    try:
+        await download_telegram_file(bot, pending.file_id, input_path)
+        await compress_image(
+            input_path,
+            output_path,
+            settings.image_compress_quality,
+            settings.image_compress_max_side,
+        )
+    except Exception:
+        record_operation_metric(
+            usage_db,
+            pending.user_id,
+            "image_compress",
+            pending.file_size,
+            output_path,
+            "failed",
+        )
+        raise
+
+    record_operation_metric(
+        usage_db,
+        pending.user_id,
+        "image_compress",
+        pending.file_size,
+        output_path,
+        "success",
+    )
+    return output_path, output_name
+
+
+def zip_files(input_paths: list[Path], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(output_path, "w", compression=ZIP_DEFLATED) as archive:
+        for input_path in input_paths:
+            archive.write(input_path, arcname=input_path.name)
+    return output_path
+
+
 async def handle_album_conversion(
     callback: CallbackQuery,
     bot: Bot,
@@ -1346,8 +1963,15 @@ async def handle_album_conversion(
         await callback.answer("Не удалось отправить результат в этот чат.", show_alert=True)
         return
 
-    if action not in {ALBUM_ACTION_INDIVIDUAL, ALBUM_ACTION_MERGE}:
+    if action not in {ALBUM_ACTION_INDIVIDUAL, ALBUM_ACTION_MERGE, ALBUM_ACTION_COMPRESS_IMAGES}:
         await callback.answer("Неизвестное действие.", show_alert=True)
+        return
+
+    if action == ALBUM_ACTION_COMPRESS_IMAGES and any(
+        file.conversion_type != "image" for file in files
+    ):
+        album_conversion_sessions[job_id] = files
+        await callback.answer("Сжать пачкой можно только изображения.", show_alert=True)
         return
 
     total_input_bytes = sum(file.file_size or 0 for file in files)
@@ -1368,6 +1992,33 @@ async def handle_album_conversion(
     job_dir = settings.workdir / job_id
     try:
         job_dir.mkdir(parents=True, exist_ok=True)
+
+        if action == ALBUM_ACTION_COMPRESS_IMAGES:
+            await callback.message.answer("Скачиваю и сжимаю фото...")
+            compressed: list[tuple[Path, str]] = []
+            for index, pending in enumerate(ordered_pending_files(files), start=1):
+                compressed.append(
+                    await compress_pending_image_to_jpg(
+                        bot,
+                        pending,
+                        job_dir,
+                        index,
+                        settings,
+                        usage_db,
+                    )
+                )
+
+            zip_path = job_dir / "compressed_images.zip"
+            zip_files([path for path, _ in compressed], zip_path)
+            await send_document_result(
+                callback.message,
+                zip_path,
+                "compressed_images.zip",
+                "Готово. Фото сжаты и упакованы в ZIP.",
+                settings,
+            )
+            return
+
         await callback.message.answer("Скачиваю и конвертирую файлы в PDF...")
 
         converted: list[tuple[Path, str]] = []
@@ -1423,7 +2074,88 @@ async def handle_album_conversion(
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-async def handle_pdf_file_callback(callback: CallbackQuery) -> None:
+async def compress_pdf_file_for_message(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+    user_id: int,
+    pdf_file: PdfToolFile,
+) -> bool:
+    job_id = uuid.uuid4().hex
+    job_dir = settings.workdir / job_id
+    input_path = job_dir / f"input_{safe_stem(pdf_file.file_name)}.pdf"
+    output_name = safe_compressed_pdf_name(pdf_file.file_name)
+    output_path = job_dir / output_name
+
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        await message.answer("Скачиваю PDF...")
+        await download_telegram_file(bot, pdf_file.file_id, input_path)
+        await message.answer("Сжимаю PDF...")
+        await compress_pdf(
+            input_path,
+            output_path,
+            settings.pdf_compress_quality,
+        )
+        sent = await send_document_result(
+            message,
+            output_path,
+            output_name,
+            (
+                f"Готово. PDF сжат: было {file_size_mb(input_path):.1f} МБ, "
+                f"стало {file_size_mb(output_path):.1f} МБ."
+            ),
+            settings,
+        )
+        record_operation_metric(
+            usage_db,
+            user_id,
+            "pdf_compress",
+            pdf_file.file_size,
+            output_path,
+            "success" if sent else "failed",
+        )
+        return sent
+    except (ConversionToolMissingError, ConversionError) as exc:
+        record_operation_metric(
+            usage_db,
+            user_id,
+            "pdf_compress",
+            pdf_file.file_size,
+            output_path,
+            "failed",
+        )
+        await message.answer(
+            f"Не удалось сжать PDF: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+        return False
+    except Exception:
+        record_operation_metric(
+            usage_db,
+            user_id,
+            "pdf_compress",
+            pdf_file.file_size,
+            output_path,
+            "failed",
+        )
+        logging.exception("Unexpected PDF compression failure")
+        await message.answer(
+            "Произошла неожиданная ошибка при сжатии PDF.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return False
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def handle_pdf_file_callback(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
     if callback.data is None or not callback.data.startswith(PDF_FILE_CALLBACK_PREFIX):
         return
 
@@ -1487,6 +2219,18 @@ async def handle_pdf_file_callback(callback: CallbackQuery) -> None:
         )
         return
 
+    if action == PDF_TOOL_COMPRESS:
+        await callback.answer("Сжимаю PDF...")
+        await compress_pdf_file_for_message(
+            callback.message,
+            bot,
+            settings,
+            usage_db,
+            callback.from_user.id,
+            pdf_file,
+        )
+        return
+
     await callback.answer("Неизвестное действие.", show_alert=True)
 
 
@@ -1494,6 +2238,7 @@ async def handle_pdf_tool_callback(
     callback: CallbackQuery,
     bot: Bot,
     settings: Settings,
+    usage_db: BotDatabase,
 ) -> None:
     if callback.data is None or not callback.data.startswith(PDF_TOOL_CALLBACK_PREFIX):
         return
@@ -1508,7 +2253,7 @@ async def handle_pdf_tool_callback(
             await callback.message.answer("Действие отменено.", reply_markup=main_menu_keyboard())
         return
 
-    if action in {PDF_TOOL_MERGE, PDF_TOOL_SPLIT, PDF_TOOL_DELETE}:
+    if action in {PDF_TOOL_MERGE, PDF_TOOL_SPLIT, PDF_TOOL_DELETE, PDF_TOOL_COMPRESS}:
         pdf_tool_sessions[user_id] = PdfToolSession(action=action)
         await callback.answer()
         if callback.message is None:
@@ -1523,19 +2268,24 @@ async def handle_pdf_tool_callback(
                 "Пришли один PDF-файл. После этого можно нажать «Разделить все страницы в ZIP» или написать диапазон страниц для отдельного PDF, например: 1-3,5.",
                 reply_markup=cancel_keyboard(),
             )
-        else:
+        elif action == PDF_TOOL_DELETE:
             await callback.message.answer(
                 "Пришли один PDF-файл. Затем напиши страницы для удаления, например: 2,5-7.",
+                reply_markup=cancel_keyboard(),
+            )
+        else:
+            await callback.message.answer(
+                "Пришли один PDF-файл, и я попробую его сжать.",
                 reply_markup=cancel_keyboard(),
             )
         return
 
     if action == PDF_TOOL_MERGE_DONE:
-        await merge_pdf_session(callback, bot, settings)
+        await merge_pdf_session(callback, bot, settings, usage_db)
         return
 
     if action == PDF_TOOL_SPLIT_ALL:
-        await split_pdf_session(callback, bot, settings)
+        await split_pdf_session(callback, bot, settings, usage_db)
         return
 
 
@@ -1543,6 +2293,7 @@ async def handle_pdf_tool_document(
     message: Message,
     bot: Bot,
     settings: Settings,
+    usage_db: BotDatabase,
 ) -> None:
     document = message.document
     if document is None or message.from_user is None:
@@ -1560,6 +2311,15 @@ async def handle_pdf_tool_document(
     size_error = check_size(document.file_size, settings)
     if size_error:
         await message.answer(size_error, reply_markup=main_menu_keyboard())
+        return
+    limit_error = weekly_limit_error(
+        user_id,
+        document.file_size,
+        settings,
+        usage_db,
+    )
+    if limit_error:
+        await message.answer(limit_error, reply_markup=main_menu_keyboard())
         return
 
     file_name = document.file_name or "file.pdf"
@@ -1604,6 +2364,20 @@ async def handle_pdf_tool_document(
         )
         return
 
+    if session.action == PDF_TOOL_COMPRESS:
+        session.files = session.files[-1:]
+        pdf_file = session.files[-1]
+        pdf_tool_sessions.pop(user_id, None)
+        await compress_pdf_file_for_message(
+            message,
+            bot,
+            settings,
+            usage_db,
+            user_id,
+            pdf_file,
+        )
+        return
+
 
 async def download_pdf_tool_file(
     bot: Bot,
@@ -1616,7 +2390,12 @@ async def download_pdf_tool_file(
     return input_path
 
 
-async def merge_pdf_session(callback: CallbackQuery, bot: Bot, settings: Settings) -> None:
+async def merge_pdf_session(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
     session = pdf_tool_sessions.get(callback.from_user.id)
     if session is None or session.action != PDF_TOOL_MERGE:
         await callback.answer("Сначала выбери склейку PDF.", show_alert=True)
@@ -1628,6 +2407,18 @@ async def merge_pdf_session(callback: CallbackQuery, bot: Bot, settings: Setting
 
     if callback.message is None:
         await callback.answer("Не удалось отправить результат в этот чат.", show_alert=True)
+        return
+
+    total_input_bytes = sum(file.file_size or 0 for file in session.files)
+    limit_error = weekly_limit_error(
+        callback.from_user.id,
+        total_input_bytes,
+        settings,
+        usage_db,
+        incoming_files=len(session.files),
+    )
+    if limit_error:
+        await callback.answer(limit_error, show_alert=True)
         return
 
     await callback.answer("Склеиваю PDF...")
@@ -1653,6 +2444,14 @@ async def merge_pdf_session(callback: CallbackQuery, bot: Bot, settings: Setting
             "Готово. PDF-файлы склеены.",
             settings,
         )
+        record_operation_metric(
+            usage_db,
+            callback.from_user.id,
+            "pdf_merge",
+            total_input_bytes,
+            output_path,
+            "success" if sent else "failed",
+        )
         if sent:
             pdf_tool_sessions.pop(callback.from_user.id, None)
         else:
@@ -1662,12 +2461,28 @@ async def merge_pdf_session(callback: CallbackQuery, bot: Bot, settings: Setting
                 reply_markup=main_menu_keyboard(),
             )
     except ConversionError as exc:
+        record_operation_metric(
+            usage_db,
+            callback.from_user.id,
+            "pdf_merge",
+            total_input_bytes,
+            output_path,
+            "failed",
+        )
         await callback.message.answer(
             f"Не удалось склеить PDF: {exc}\n\n"
             "Режим склейки остается активным: можно добавить другой PDF, нажать склейку еще раз или отменить.",
             reply_markup=merge_session_keyboard(),
         )
     except Exception:
+        record_operation_metric(
+            usage_db,
+            callback.from_user.id,
+            "pdf_merge",
+            total_input_bytes,
+            output_path,
+            "failed",
+        )
         logging.exception("Unexpected PDF merge failure")
         pdf_tool_sessions.pop(callback.from_user.id, None)
         await callback.message.answer(
@@ -1678,7 +2493,12 @@ async def merge_pdf_session(callback: CallbackQuery, bot: Bot, settings: Setting
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-async def split_pdf_session(callback: CallbackQuery, bot: Bot, settings: Settings) -> None:
+async def split_pdf_session(
+    callback: CallbackQuery,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
     session = pdf_tool_sessions.get(callback.from_user.id)
     if session is None or session.action != PDF_TOOL_SPLIT or not session.files:
         await callback.answer("Сначала пришли PDF для разделения.", show_alert=True)
@@ -1688,12 +2508,21 @@ async def split_pdf_session(callback: CallbackQuery, bot: Bot, settings: Setting
         await callback.answer("Не удалось отправить результат в этот чат.", show_alert=True)
         return
 
-    await callback.answer("Разделяю PDF...")
-
     job_id = uuid.uuid4().hex
     job_dir = settings.workdir / job_id
     pdf_file = session.files[-1]
     input_path = job_dir / f"input_{safe_stem(pdf_file.file_name)}.pdf"
+    limit_error = weekly_limit_error(
+        callback.from_user.id,
+        pdf_file.file_size,
+        settings,
+        usage_db,
+    )
+    if limit_error:
+        await callback.answer(limit_error, show_alert=True)
+        return
+
+    await callback.answer("Разделяю PDF...")
 
     try:
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -1714,14 +2543,37 @@ async def split_pdf_session(callback: CallbackQuery, bot: Bot, settings: Setting
                 caption,
                 settings,
             )
+        usage_db.record_conversion(
+            callback.from_user.id,
+            "pdf_split_all",
+            pdf_file.file_size,
+            sum(zip_path.stat().st_size for zip_path in zip_paths if zip_path.exists()),
+            "success",
+        )
         pdf_tool_sessions.pop(callback.from_user.id, None)
     except ConversionError as exc:
+        record_operation_metric(
+            usage_db,
+            callback.from_user.id,
+            "pdf_split_all",
+            pdf_file.file_size,
+            None,
+            "failed",
+        )
         await callback.message.answer(
             f"Не удалось разделить PDF: {exc}\n\n"
             "Режим разделения остается активным: можно написать диапазон страниц или нажать «Отмена».",
             reply_markup=split_session_keyboard(),
         )
     except Exception:
+        record_operation_metric(
+            usage_db,
+            callback.from_user.id,
+            "pdf_split_all",
+            pdf_file.file_size,
+            None,
+            "failed",
+        )
         logging.exception("Unexpected PDF split failure")
         pdf_tool_sessions.pop(callback.from_user.id, None)
         await callback.message.answer(
@@ -1736,6 +2588,7 @@ async def handle_pdf_range_text(
     message: Message,
     bot: Bot,
     settings: Settings,
+    usage_db: BotDatabase,
 ) -> bool:
     if message.from_user is None or not message.text:
         return False
@@ -1761,17 +2614,28 @@ async def handle_pdf_range_text(
     job_dir = settings.workdir / job_id
     pdf_file = session.files[-1]
     input_path = job_dir / f"input_{safe_stem(pdf_file.file_name)}.pdf"
+    limit_error = weekly_limit_error(
+        user_id,
+        pdf_file.file_size,
+        settings,
+        usage_db,
+    )
+    if limit_error:
+        await message.answer(limit_error, reply_markup=main_menu_keyboard())
+        return True
 
     if session.action == PDF_TOOL_SPLIT:
         output_name = f"{safe_stem(pdf_file.file_name)}_pages.pdf"
         output_path = job_dir / output_name
         action_text = "вырезать страницы"
         result_caption = "Готово. Выбранные страницы сохранены в отдельный PDF."
+        operation_type = "pdf_extract_pages"
     else:
         output_name = f"{safe_stem(pdf_file.file_name)}_without_pages.pdf"
         output_path = job_dir / output_name
         action_text = "удалить страницы"
         result_caption = "Готово. Выбранные страницы удалены."
+        operation_type = "pdf_delete_pages"
 
     try:
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -1790,6 +2654,14 @@ async def handle_pdf_range_text(
             result_caption,
             settings,
         )
+        record_operation_metric(
+            usage_db,
+            user_id,
+            operation_type,
+            pdf_file.file_size,
+            output_path,
+            "success" if sent else "failed",
+        )
         if sent:
             pdf_tool_sessions.pop(user_id, None)
         else:
@@ -1799,12 +2671,28 @@ async def handle_pdf_range_text(
                 reply_markup=main_menu_keyboard(),
             )
     except ConversionError as exc:
+        record_operation_metric(
+            usage_db,
+            user_id,
+            operation_type,
+            pdf_file.file_size,
+            output_path,
+            "failed",
+        )
         await message.answer(
             f"Не удалось обработать PDF: {exc}\n\n"
             "Попробуйте еще раз. Можно написать другой диапазон страниц, например 1-3,5, или нажать «Отмена».",
             reply_markup=cancel_keyboard(),
         )
     except Exception:
+        record_operation_metric(
+            usage_db,
+            user_id,
+            operation_type,
+            pdf_file.file_size,
+            output_path,
+            "failed",
+        )
         logging.exception("Unexpected PDF page operation failure")
         pdf_tool_sessions.pop(user_id, None)
         await message.answer(
@@ -1817,9 +2705,16 @@ async def handle_pdf_range_text(
     return True
 
 
-async def handle_plain_text(message: Message, bot: Bot, settings: Settings) -> None:
+async def handle_plain_text(
+    message: Message,
+    bot: Bot,
+    settings: Settings,
+    usage_db: BotDatabase,
+) -> None:
     if message.text and message.text.startswith(("/start", "/help")):
         return
+
+    touch_user_metrics(message, usage_db)
 
     if message.text == MAIN_BUTTON_HELP:
         await send_features(message)
@@ -1829,7 +2724,7 @@ async def handle_plain_text(message: Message, bot: Bot, settings: Settings) -> N
         await send_pdf_tools(message)
         return
 
-    if await handle_pdf_range_text(message, bot, settings):
+    if await handle_pdf_range_text(message, bot, settings, usage_db):
         return
 
     await message.answer(
@@ -1847,6 +2742,8 @@ async def main() -> None:
 
     settings = load_settings()
     settings.workdir.mkdir(parents=True, exist_ok=True)
+    usage_db = BotDatabase(settings.db_path)
+    usage_db.init()
 
     for tool_name in ("djvused", "djvups", "pdftoppm", "ps2pdf", "qpdf", "soffice", "tesseract"):
         if shutil.which(tool_name) is None:
@@ -1855,13 +2752,35 @@ async def main() -> None:
     bot = create_bot(settings)
     dp = Dispatcher()
     dp["settings"] = settings
+    dp["usage_db"] = usage_db
 
     dp.message.register(handle_start, Command("start", "help"))
+    dp.message.register(handle_admin, Command("admin"))
     dp.message.register(handle_document, F.document)
     dp.message.register(handle_photo, F.photo)
     dp.callback_query.register(
+        handle_admin_callback,
+        F.data.startswith(ADMIN_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
         handle_conversion,
         F.data.startswith(CONVERT_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
+        handle_image_compression,
+        F.data.startswith(COMPRESS_IMAGE_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
+        handle_archive_extraction,
+        F.data.startswith(EXTRACT_ARCHIVE_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
+        handle_archive_page,
+        F.data.startswith(ARCHIVE_PAGE_CALLBACK_PREFIX),
+    )
+    dp.callback_query.register(
+        handle_archive_file_selection,
+        F.data.startswith(ARCHIVE_SELECT_CALLBACK_PREFIX),
     )
     dp.callback_query.register(
         handle_album_conversion,

@@ -4,8 +4,13 @@ import gc
 import os
 import subprocess
 import shutil
+import tarfile
+import tempfile
+from dataclasses import dataclass
 from io import BytesIO
+from pathlib import PurePosixPath
 from pathlib import Path
+from zipfile import BadZipFile
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
@@ -15,6 +20,12 @@ class ConversionError(RuntimeError):
 
 class ConversionToolMissingError(ConversionError):
     """Raised when an external conversion tool is not available."""
+
+
+@dataclass(frozen=True)
+class ArchiveEntry:
+    name: str
+    size: int
 
 
 def _run_sync_process(args: list[str], timeout_seconds: int | None = None) -> str:
@@ -724,6 +735,884 @@ def _convert_image_to_pdf_sync(input_path: Path, output_path: Path) -> None:
 async def convert_image_to_pdf(input_path: Path, output_path: Path) -> Path:
     await asyncio.to_thread(_convert_image_to_pdf_sync, input_path, output_path)
     return output_path
+
+
+def _resize_image_to_max_side(image, max_side: int):
+    if max_side <= 0:
+        return image
+
+    width, height = image.size
+    longest_side = max(width, height)
+    if longest_side <= max_side:
+        return image
+
+    ratio = max_side / longest_side
+    new_size = (max(1, int(width * ratio)), max(1, int(height * ratio)))
+    return image.resize(new_size)
+
+
+def _compress_image_sync(
+    input_path: Path,
+    output_path: Path,
+    quality: int,
+    max_side: int,
+) -> None:
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "Pillow is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    quality = min(95, max(1, quality))
+
+    try:
+        with Image.open(input_path) as image:
+            page = ImageOps.exif_transpose(image).convert("RGBA")
+            page = _resize_image_to_max_side(page, max_side)
+            background = Image.new("RGB", page.size, "white")
+            background.paste(page, mask=page.getchannel("A"))
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            background.save(
+                output_path,
+                "JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+            )
+    except UnidentifiedImageError as exc:
+        raise ConversionError("The image format is not supported or the file is damaged.") from exc
+    except OSError as exc:
+        raise ConversionError(str(exc)) from exc
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise ConversionError("Image compression finished, but the output file was not created.")
+
+
+async def compress_image(
+    input_path: Path,
+    output_path: Path,
+    quality: int = 75,
+    max_side: int = 1600,
+) -> Path:
+    await asyncio.to_thread(
+        _compress_image_sync,
+        input_path,
+        output_path,
+        quality,
+        max_side,
+    )
+    return output_path
+
+
+async def compress_pdf(
+    input_path: Path,
+    output_path: Path,
+    quality: str = "ebook",
+    timeout_seconds: int = 600,
+) -> Path:
+    ghostscript_path = shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+    if ghostscript_path is None:
+        raise ConversionToolMissingError(
+            "Ghostscript was not found. Install Ghostscript or run the bot in Docker."
+        )
+
+    quality = quality.strip().lstrip("/").lower()
+    if quality not in {"screen", "ebook", "printer", "prepress", "default"}:
+        quality = "ebook"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    await _run_process(
+        [
+            ghostscript_path,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS=/{quality}",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            str(input_path),
+        ],
+        timeout_seconds,
+        output_path,
+    )
+    return output_path
+
+
+def _safe_archive_name(raw_name: str) -> str | None:
+    normalized_name = raw_name.replace("\\", "/").strip("/")
+    if not normalized_name:
+        return None
+
+    path = PurePosixPath(normalized_name)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    return path.as_posix()
+
+
+def _archive_is_tar(input_path: Path) -> bool:
+    name = input_path.name.lower()
+    return name.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz"))
+
+
+def _archive_is_zip(input_path: Path) -> bool:
+    return input_path.suffix.lower() == ".zip"
+
+
+def _archive_is_7z(input_path: Path) -> bool:
+    return input_path.suffix.lower() == ".7z"
+
+
+def _archive_is_rar(input_path: Path) -> bool:
+    return input_path.suffix.lower() == ".rar"
+
+
+def _add_archive_file_to_limits(
+    safe_name: str | None,
+    file_size: int,
+    file_count: int,
+    total_bytes: int,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    if safe_name is None:
+        return file_count, total_bytes
+
+    file_count += 1
+    if file_count > max_files:
+        raise ConversionError(
+            f"Archive contains too many files. Limit: {max_files}."
+        )
+
+    total_bytes += int(file_size)
+    if total_bytes > max_total_bytes:
+        raise ConversionError(
+            f"Unpacked files are too large. Limit: {max_total_bytes // (1024 * 1024)} MB."
+        )
+
+    return file_count, total_bytes
+
+
+def _ensure_archive_file_count(file_count: int, max_files: int) -> None:
+    if file_count > max_files:
+        raise ConversionError(
+            f"Archive contains too many files. Limit: {max_files}."
+        )
+
+
+def _archive_output_path(output_dir: Path, safe_name: str) -> Path:
+    output_root = output_dir.resolve()
+    output_path = (output_dir / safe_name).resolve()
+    if output_root not in output_path.parents:
+        raise ConversionError("Archive contains unsafe file paths.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return output_path
+
+
+def _copy_archive_stream_to_file(source_file, output_dir: Path, safe_name: str) -> Path:
+    output_path = _archive_output_path(output_dir, safe_name)
+    with output_path.open("wb") as output_file:
+        shutil.copyfileobj(source_file, output_file)
+    return output_path
+
+
+def _list_zip_archive_entries(input_path: Path, max_files: int) -> list[ArchiveEntry]:
+    entries: list[ArchiveEntry] = []
+    try:
+        with ZipFile(input_path) as source_archive:
+            for item in source_archive.infolist():
+                if item.is_dir():
+                    continue
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None:
+                    continue
+                entries.append(ArchiveEntry(safe_name, int(item.file_size)))
+                _ensure_archive_file_count(len(entries), max_files)
+    except BadZipFile as exc:
+        raise ConversionError("ZIP archive is damaged or not supported.") from exc
+    return entries
+
+
+def _list_tar_archive_entries(input_path: Path, max_files: int) -> list[ArchiveEntry]:
+    entries: list[ArchiveEntry] = []
+    try:
+        with tarfile.open(input_path, mode="r:*") as source_archive:
+            for item in source_archive:
+                if not item.isfile():
+                    continue
+                safe_name = _safe_archive_name(item.name)
+                if safe_name is None:
+                    continue
+                entries.append(ArchiveEntry(safe_name, int(item.size)))
+                _ensure_archive_file_count(len(entries), max_files)
+    except tarfile.TarError as exc:
+        raise ConversionError("TAR archive is damaged or not supported.") from exc
+    return entries
+
+
+def _list_7z_archive_entries(input_path: Path, max_files: int) -> list[ArchiveEntry]:
+    try:
+        from py7zr import SevenZipFile
+        from py7zr.exceptions import Bad7zFile, PasswordRequired
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "py7zr is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    entries: list[ArchiveEntry] = []
+    try:
+        with SevenZipFile(input_path, mode="r") as source_archive:
+            for item in source_archive.list():
+                if getattr(item, "is_directory", False):
+                    continue
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None:
+                    continue
+                file_size = int(getattr(item, "uncompressed", 0) or 0)
+                entries.append(ArchiveEntry(safe_name, file_size))
+                _ensure_archive_file_count(len(entries), max_files)
+    except Bad7zFile as exc:
+        raise ConversionError("7Z archive is damaged or not supported.") from exc
+    except PasswordRequired as exc:
+        raise ConversionError("Encrypted 7Z archives are not supported.") from exc
+    return entries
+
+
+def _list_rar_archive_entries(input_path: Path, max_files: int) -> list[ArchiveEntry]:
+    try:
+        import rarfile
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "rarfile is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    entries: list[ArchiveEntry] = []
+    try:
+        with rarfile.RarFile(input_path) as source_archive:
+            for item in source_archive.infolist():
+                if item.isdir():
+                    continue
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None:
+                    continue
+                entries.append(ArchiveEntry(safe_name, int(item.file_size)))
+                _ensure_archive_file_count(len(entries), max_files)
+    except rarfile.PasswordRequired as exc:
+        raise ConversionError("Encrypted RAR archives are not supported.") from exc
+    except rarfile.RarCannotExec as exc:
+        raise ConversionToolMissingError(
+            "RAR extraction tool was not found. Install unar or run the bot in Docker."
+        ) from exc
+    except rarfile.Error as exc:
+        raise ConversionError("RAR archive is damaged or not supported.") from exc
+    return entries
+
+
+def _list_archive_files_sync(input_path: Path, max_files: int) -> list[ArchiveEntry]:
+    if max_files <= 0:
+        raise ConversionError("Archive file count limit must be positive.")
+    if _archive_is_zip(input_path):
+        entries = _list_zip_archive_entries(input_path, max_files)
+    elif _archive_is_tar(input_path):
+        entries = _list_tar_archive_entries(input_path, max_files)
+    elif _archive_is_7z(input_path):
+        entries = _list_7z_archive_entries(input_path, max_files)
+    elif _archive_is_rar(input_path):
+        entries = _list_rar_archive_entries(input_path, max_files)
+    else:
+        raise ConversionError("Archive format is not supported.")
+    if not entries:
+        raise ConversionError("Archive does not contain files that can be unpacked.")
+    return entries
+
+
+def _write_zip_archive_contents(
+    input_path: Path,
+    output_zip_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    total_bytes = 0
+    file_count = 0
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with ZipFile(input_path) as source_archive:
+            with ZipFile(output_zip_path, "w", compression=ZIP_DEFLATED) as result_archive:
+                for item in source_archive.infolist():
+                    if item.is_dir():
+                        continue
+
+                    safe_name = _safe_archive_name(item.filename)
+                    if safe_name is None:
+                        continue
+
+                    file_count, total_bytes = _add_archive_file_to_limits(
+                        safe_name,
+                        item.file_size,
+                        file_count,
+                        total_bytes,
+                        max_total_bytes,
+                        max_files,
+                    )
+
+                    with source_archive.open(item) as source_file:
+                        with result_archive.open(safe_name, "w") as output_file:
+                            shutil.copyfileobj(source_file, output_file)
+    except BadZipFile as exc:
+        raise ConversionError("ZIP archive is damaged or not supported.") from exc
+
+    return file_count, total_bytes
+
+
+def _write_tar_archive_contents(
+    input_path: Path,
+    output_zip_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    total_bytes = 0
+    file_count = 0
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tarfile.open(input_path, mode="r:*") as source_archive:
+            with ZipFile(output_zip_path, "w", compression=ZIP_DEFLATED) as result_archive:
+                for item in source_archive:
+                    if not item.isfile():
+                        continue
+
+                    safe_name = _safe_archive_name(item.name)
+                    if safe_name is None:
+                        continue
+
+                    file_count, total_bytes = _add_archive_file_to_limits(
+                        safe_name,
+                        item.size,
+                        file_count,
+                        total_bytes,
+                        max_total_bytes,
+                        max_files,
+                    )
+
+                    source_file = source_archive.extractfile(item)
+                    if source_file is None:
+                        continue
+                    with source_file:
+                        with result_archive.open(safe_name, "w") as output_file:
+                            shutil.copyfileobj(source_file, output_file)
+    except tarfile.TarError as exc:
+        raise ConversionError("TAR archive is damaged or not supported.") from exc
+
+    return file_count, total_bytes
+
+
+def _write_7z_archive_contents(
+    input_path: Path,
+    output_zip_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    try:
+        from py7zr import SevenZipFile
+        from py7zr.exceptions import Bad7zFile, PasswordRequired
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "py7zr is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    file_count = 0
+    total_bytes = 0
+    targets: list[tuple[str, str]] = []
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with SevenZipFile(input_path, mode="r") as source_archive:
+            for item in source_archive.list():
+                if getattr(item, "is_directory", False):
+                    continue
+
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None:
+                    continue
+
+                raw_file_size = getattr(item, "uncompressed", None)
+                if raw_file_size is None:
+                    raise ConversionError("7Z archive contains files with unknown unpacked size.")
+                file_size = int(raw_file_size)
+                file_count, total_bytes = _add_archive_file_to_limits(
+                    safe_name,
+                    file_size,
+                    file_count,
+                    total_bytes,
+                    max_total_bytes,
+                    max_files,
+                )
+                targets.append((item.filename, safe_name))
+
+            if not targets:
+                return 0, 0
+
+            with tempfile.TemporaryDirectory(prefix="extract-7z-") as temp_dir_name:
+                temp_dir = Path(temp_dir_name)
+                source_archive.extract(path=temp_dir, targets=[name for name, _ in targets])
+                actual_total_bytes = 0
+                actual_file_count = 0
+                with ZipFile(output_zip_path, "w", compression=ZIP_DEFLATED) as result_archive:
+                    for original_name, safe_name in targets:
+                        extracted_path = (temp_dir / original_name).resolve()
+                        if not extracted_path.is_file():
+                            raise ConversionError(f"7Z archive did not extract {original_name}.")
+                        if temp_dir.resolve() not in extracted_path.parents:
+                            raise ConversionError("7Z archive contains unsafe file paths.")
+                        actual_file_count += 1
+                        actual_total_bytes += extracted_path.stat().st_size
+                        if actual_file_count > max_files:
+                            raise ConversionError(
+                                f"Archive contains too many files. Limit: {max_files}."
+                            )
+                        if actual_total_bytes > max_total_bytes:
+                            raise ConversionError(
+                                f"Unpacked files are too large. Limit: {max_total_bytes // (1024 * 1024)} MB."
+                            )
+                        with extracted_path.open("rb") as source_file:
+                            with result_archive.open(safe_name, "w") as output_file:
+                                shutil.copyfileobj(source_file, output_file)
+                file_count = actual_file_count
+                total_bytes = actual_total_bytes
+    except Bad7zFile as exc:
+        raise ConversionError("7Z archive is damaged or not supported.") from exc
+    except PasswordRequired as exc:
+        raise ConversionError("Encrypted 7Z archives are not supported.") from exc
+
+    return file_count, total_bytes
+
+
+def _write_rar_archive_contents(
+    input_path: Path,
+    output_zip_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    try:
+        import rarfile
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "rarfile is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    total_bytes = 0
+    file_count = 0
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with rarfile.RarFile(input_path) as source_archive:
+            with ZipFile(output_zip_path, "w", compression=ZIP_DEFLATED) as result_archive:
+                for item in source_archive.infolist():
+                    if item.isdir():
+                        continue
+
+                    safe_name = _safe_archive_name(item.filename)
+                    if safe_name is None:
+                        continue
+
+                    file_count, total_bytes = _add_archive_file_to_limits(
+                        safe_name,
+                        item.file_size,
+                        file_count,
+                        total_bytes,
+                        max_total_bytes,
+                        max_files,
+                    )
+
+                    with source_archive.open(item) as source_file:
+                        with result_archive.open(safe_name, "w") as output_file:
+                            shutil.copyfileobj(source_file, output_file)
+    except rarfile.PasswordRequired as exc:
+        raise ConversionError("Encrypted RAR archives are not supported.") from exc
+    except rarfile.RarCannotExec as exc:
+        raise ConversionToolMissingError(
+            "RAR extraction tool was not found. Install unar or run the bot in Docker."
+        ) from exc
+    except rarfile.Error as exc:
+        raise ConversionError("RAR archive is damaged or not supported.") from exc
+
+    return file_count, total_bytes
+
+
+def _extract_archive_to_zip_sync(
+    input_path: Path,
+    output_zip_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    if max_total_bytes <= 0:
+        raise ConversionError("Archive output size limit must be positive.")
+    if max_files <= 0:
+        raise ConversionError("Archive file count limit must be positive.")
+
+    if _archive_is_zip(input_path):
+        file_count, total_bytes = _write_zip_archive_contents(
+            input_path,
+            output_zip_path,
+            max_total_bytes,
+            max_files,
+        )
+    elif _archive_is_tar(input_path):
+        file_count, total_bytes = _write_tar_archive_contents(
+            input_path,
+            output_zip_path,
+            max_total_bytes,
+            max_files,
+        )
+    elif _archive_is_7z(input_path):
+        file_count, total_bytes = _write_7z_archive_contents(
+            input_path,
+            output_zip_path,
+            max_total_bytes,
+            max_files,
+        )
+    elif _archive_is_rar(input_path):
+        file_count, total_bytes = _write_rar_archive_contents(
+            input_path,
+            output_zip_path,
+            max_total_bytes,
+            max_files,
+        )
+    else:
+        raise ConversionError("Archive format is not supported.")
+
+    if file_count == 0:
+        output_zip_path.unlink(missing_ok=True)
+        raise ConversionError("Archive does not contain files that can be unpacked.")
+    if not output_zip_path.exists() or output_zip_path.stat().st_size == 0:
+        raise ConversionError("Archive was processed, but the output ZIP was not created.")
+
+    return file_count, total_bytes
+
+
+async def extract_archive_to_zip(
+    input_path: Path,
+    output_zip_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[int, int]:
+    return await asyncio.to_thread(
+        _extract_archive_to_zip_sync,
+        input_path,
+        output_zip_path,
+        max_total_bytes,
+        max_files,
+    )
+
+
+async def list_archive_files(
+    input_path: Path,
+    max_total_bytes: int,
+    max_files: int,
+) -> list[ArchiveEntry]:
+    return await asyncio.to_thread(_list_archive_files_sync, input_path, max_files)
+
+
+def _extract_normalized_zip_to_files(
+    normalized_zip_path: Path,
+    output_dir: Path,
+    selected_names: set[str] | None,
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = output_dir.resolve()
+    output_paths: list[Path] = []
+
+    try:
+        with ZipFile(normalized_zip_path) as archive:
+            for item in archive.infolist():
+                if item.is_dir():
+                    continue
+
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None:
+                    continue
+                if selected_names is not None and safe_name not in selected_names:
+                    continue
+
+                output_path = (output_dir / safe_name).resolve()
+                if output_root not in output_path.parents:
+                    raise ConversionError("Archive contains unsafe file paths.")
+
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(item) as source_file:
+                    with output_path.open("wb") as output_file:
+                        shutil.copyfileobj(source_file, output_file)
+                output_paths.append(output_path)
+    except BadZipFile as exc:
+        raise ConversionError("ZIP archive is damaged or not supported.") from exc
+
+    if not output_paths:
+        raise ConversionError("No selected files were extracted.")
+    return output_paths
+
+
+def _extract_selected_zip_files(
+    input_path: Path,
+    output_dir: Path,
+    selected_names: set[str],
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[list[Path], int]:
+    output_paths: list[Path] = []
+    total_bytes = 0
+    file_count = 0
+    try:
+        with ZipFile(input_path) as source_archive:
+            for item in source_archive.infolist():
+                if item.is_dir():
+                    continue
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None or safe_name not in selected_names:
+                    continue
+                file_count, total_bytes = _add_archive_file_to_limits(
+                    safe_name,
+                    item.file_size,
+                    file_count,
+                    total_bytes,
+                    max_total_bytes,
+                    max_files,
+                )
+                with source_archive.open(item) as source_file:
+                    output_paths.append(
+                        _copy_archive_stream_to_file(source_file, output_dir, safe_name)
+                    )
+    except BadZipFile as exc:
+        raise ConversionError("ZIP archive is damaged or not supported.") from exc
+    return output_paths, total_bytes
+
+
+def _extract_selected_tar_files(
+    input_path: Path,
+    output_dir: Path,
+    selected_names: set[str],
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[list[Path], int]:
+    output_paths: list[Path] = []
+    total_bytes = 0
+    file_count = 0
+    try:
+        with tarfile.open(input_path, mode="r:*") as source_archive:
+            for item in source_archive:
+                if not item.isfile():
+                    continue
+                safe_name = _safe_archive_name(item.name)
+                if safe_name is None or safe_name not in selected_names:
+                    continue
+                file_count, total_bytes = _add_archive_file_to_limits(
+                    safe_name,
+                    item.size,
+                    file_count,
+                    total_bytes,
+                    max_total_bytes,
+                    max_files,
+                )
+                source_file = source_archive.extractfile(item)
+                if source_file is None:
+                    continue
+                with source_file:
+                    output_paths.append(
+                        _copy_archive_stream_to_file(source_file, output_dir, safe_name)
+                    )
+    except tarfile.TarError as exc:
+        raise ConversionError("TAR archive is damaged or not supported.") from exc
+    return output_paths, total_bytes
+
+
+def _extract_selected_rar_files(
+    input_path: Path,
+    output_dir: Path,
+    selected_names: set[str],
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[list[Path], int]:
+    try:
+        import rarfile
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "rarfile is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    output_paths: list[Path] = []
+    total_bytes = 0
+    file_count = 0
+    try:
+        with rarfile.RarFile(input_path) as source_archive:
+            for item in source_archive.infolist():
+                if item.isdir():
+                    continue
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None or safe_name not in selected_names:
+                    continue
+                file_count, total_bytes = _add_archive_file_to_limits(
+                    safe_name,
+                    item.file_size,
+                    file_count,
+                    total_bytes,
+                    max_total_bytes,
+                    max_files,
+                )
+                with source_archive.open(item) as source_file:
+                    output_paths.append(
+                        _copy_archive_stream_to_file(source_file, output_dir, safe_name)
+                    )
+    except rarfile.PasswordRequired as exc:
+        raise ConversionError("Encrypted RAR archives are not supported.") from exc
+    except rarfile.RarCannotExec as exc:
+        raise ConversionToolMissingError(
+            "RAR extraction tool was not found. Install unar or run the bot in Docker."
+        ) from exc
+    except rarfile.Error as exc:
+        raise ConversionError("RAR archive is damaged or not supported.") from exc
+    return output_paths, total_bytes
+
+
+def _extract_selected_7z_files(
+    input_path: Path,
+    output_dir: Path,
+    selected_names: set[str],
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[list[Path], int]:
+    try:
+        from py7zr import SevenZipFile
+        from py7zr.exceptions import Bad7zFile, PasswordRequired
+    except ImportError as exc:
+        raise ConversionToolMissingError(
+            "py7zr is not installed. Install requirements or run the bot in Docker."
+        ) from exc
+
+    targets: list[tuple[str, str, int]] = []
+    total_bytes = 0
+    file_count = 0
+    try:
+        with SevenZipFile(input_path, mode="r") as source_archive:
+            for item in source_archive.list():
+                if getattr(item, "is_directory", False):
+                    continue
+                safe_name = _safe_archive_name(item.filename)
+                if safe_name is None or safe_name not in selected_names:
+                    continue
+                file_size = int(getattr(item, "uncompressed", 0) or 0)
+                file_count, total_bytes = _add_archive_file_to_limits(
+                    safe_name,
+                    file_size,
+                    file_count,
+                    total_bytes,
+                    max_total_bytes,
+                    max_files,
+                )
+                targets.append((item.filename, safe_name, file_size))
+
+            if not targets:
+                return [], 0
+
+            output_paths: list[Path] = []
+            with tempfile.TemporaryDirectory(prefix="extract-selected-7z-") as temp_dir_name:
+                temp_dir = Path(temp_dir_name)
+                source_archive.extract(path=temp_dir, targets=[name for name, _, _ in targets])
+                actual_total_bytes = 0
+                for original_name, safe_name, _ in targets:
+                    extracted_path = (temp_dir / original_name).resolve()
+                    if not extracted_path.is_file():
+                        raise ConversionError(f"7Z archive did not extract {original_name}.")
+                    if temp_dir.resolve() not in extracted_path.parents:
+                        raise ConversionError("7Z archive contains unsafe file paths.")
+                    actual_total_bytes += extracted_path.stat().st_size
+                    if actual_total_bytes > max_total_bytes:
+                        raise ConversionError(
+                            f"Unpacked files are too large. Limit: {max_total_bytes // (1024 * 1024)} MB."
+                        )
+                    output_path = _archive_output_path(output_dir, safe_name)
+                    shutil.copy2(extracted_path, output_path)
+                    output_paths.append(output_path)
+                total_bytes = actual_total_bytes
+    except Bad7zFile as exc:
+        raise ConversionError("7Z archive is damaged or not supported.") from exc
+    except PasswordRequired as exc:
+        raise ConversionError("Encrypted 7Z archives are not supported.") from exc
+    return output_paths, total_bytes
+
+
+def _extract_selected_archive_files_sync(
+    input_path: Path,
+    output_dir: Path,
+    selected_names: set[str],
+    max_total_bytes: int,
+    max_files: int,
+) -> tuple[list[Path], int]:
+    if not selected_names:
+        raise ConversionError("No files selected.")
+    if len(selected_names) > max_files:
+        raise ConversionError(f"Too many selected files. Limit: {max_files}.")
+
+    if _archive_is_zip(input_path):
+        output_paths, total_bytes = _extract_selected_zip_files(
+            input_path, output_dir, selected_names, max_total_bytes, max_files
+        )
+    elif _archive_is_tar(input_path):
+        output_paths, total_bytes = _extract_selected_tar_files(
+            input_path, output_dir, selected_names, max_total_bytes, max_files
+        )
+    elif _archive_is_7z(input_path):
+        output_paths, total_bytes = _extract_selected_7z_files(
+            input_path, output_dir, selected_names, max_total_bytes, max_files
+        )
+    elif _archive_is_rar(input_path):
+        output_paths, total_bytes = _extract_selected_rar_files(
+            input_path, output_dir, selected_names, max_total_bytes, max_files
+        )
+    else:
+        raise ConversionError("Archive format is not supported.")
+
+    if not output_paths:
+        raise ConversionError("No selected files were extracted.")
+    return output_paths, total_bytes
+
+
+async def extract_archive_to_files(
+    input_path: Path,
+    output_dir: Path,
+    max_total_bytes: int,
+    max_files: int,
+    selected_names: set[str] | None = None,
+) -> tuple[list[Path], int]:
+    if selected_names is not None:
+        return await asyncio.to_thread(
+            _extract_selected_archive_files_sync,
+            input_path,
+            output_dir,
+            selected_names,
+            max_total_bytes,
+            max_files,
+        )
+
+    normalized_zip_path = output_dir / "_normalized_archive.zip"
+    try:
+        _, total_bytes = await extract_archive_to_zip(
+            input_path,
+            normalized_zip_path,
+            max_total_bytes,
+            max_files,
+        )
+        output_paths = await asyncio.to_thread(
+            _extract_normalized_zip_to_files,
+            normalized_zip_path,
+            output_dir,
+            selected_names,
+        )
+    finally:
+        normalized_zip_path.unlink(missing_ok=True)
+
+    return output_paths, total_bytes
 
 
 def _merge_pdfs_sync(

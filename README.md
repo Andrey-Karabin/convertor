@@ -82,6 +82,7 @@ Supported input formats:
 - `.xls`, `.xlsx`, `.ods`, `.csv`
 - `.ppt`, `.pptx`, `.odp`
 - `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp`, `.tif`, `.tiff`
+- `.zip`, `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`, `.7z`, `.rar`
 - Telegram photos sent directly to the chat
 
 PDF tools:
@@ -90,10 +91,40 @@ PDF tools:
 - Split one PDF into separate page files inside a ZIP archive.
 - In split mode, type a page range like `1-3,5` to extract selected pages into a new PDF.
 - Delete selected pages from a PDF.
+- Compress a PDF file.
+
+Other tools:
+
+- Compress photos and image files to JPEG.
+- Safely unpack ZIP/TAR/7Z/RAR archives. In Telegram, the bot can send all
+  extracted files one by one or show a file list so the user can choose one
+  file to extract. Archive extraction is limited by total unpacked size and
+  file count.
+  Encrypted archives are not supported.
 
 You can open PDF tools from the `Интересные функции` menu or simply send a
 PDF file to the bot. When a PDF is uploaded directly, the bot offers available
 actions for that file.
+
+## Streamlit Web Converter
+
+The project also includes a Streamlit web interface with the same conversion
+backend. It can convert DJVU, Office documents, spreadsheets, presentations,
+and images to PDF. It also includes PDF tools for merge, compression, page
+extraction, page deletion, and splitting pages into a ZIP archive. The web
+interface also supports image compression and safe archive unpacking.
+
+Start the Telegram bot and web app together:
+
+```powershell
+docker compose --profile web up -d --build
+```
+
+Open `http://localhost:8501` on your machine. On a VPS, open
+`http://SERVER_IP:8501` only if the port is allowed by the firewall.
+
+Set `WEB_PASSWORD` in `.env` before exposing the web app to the internet. If
+`WEB_PASSWORD` is empty, anyone who can reach the port can use the converter.
 
 ## Office Document Fidelity
 
@@ -137,6 +168,31 @@ the container and refreshes the font cache before Office conversion.
   rotating a page. Increase it if pages are rotated incorrectly.
 - `WORKDIR` - temporary work directory inside the container, default is
   `/tmp/convertor`.
+- `DB_PATH` - SQLite database path for users, metrics, and limit accounting,
+  default is `/tmp/convertor/bot.sqlite3`.
+- `ADMIN_IDS` - comma-separated numeric Telegram user ids that can open
+  `/admin`. Admins are not restricted by weekly limits.
+- `WEEKLY_LIMIT_FILES` - successful operations allowed per user for the last
+  7 days. `0` disables this limit.
+- `WEEKLY_LIMIT_MB` - total input megabytes allowed per user for the last
+  7 days. `0` disables this limit.
+- `IMAGE_COMPRESS_QUALITY` - JPEG quality for compressed photos, default is
+  `75`.
+- `IMAGE_COMPRESS_MAX_SIDE` - maximum width or height for compressed photos,
+  default is `1600`. Use `0` to keep original dimensions.
+- `PDF_COMPRESS_QUALITY` - Ghostscript compression profile for PDF files,
+  default is `ebook`. Use `screen` for smaller files or `printer` for better
+  quality.
+- `ARCHIVE_MAX_OUTPUT_MB` - maximum total unpacked archive size, default is
+  `500`.
+- `ARCHIVE_MAX_FILES` - maximum number of files allowed inside an archive,
+  default is `200`.
+- `STREAMLIT_PORT` - host port for the Streamlit web interface, default is
+  `8501`.
+- `STREAMLIT_MAX_UPLOAD_MB` - Streamlit upload limit in megabytes, default is
+  `500`.
+- `WEB_PASSWORD` - optional password for the Streamlit web interface. Leave it
+  empty only for local or otherwise protected deployments.
 - `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` - required only for the local
   Telegram Bot API server.
 - `TELEGRAM_API_BASE` - set to `http://telegram-bot-api:8081` to make the bot
@@ -145,3 +201,14 @@ the container and refreshes the font cache before Office conversion.
   `TELEGRAM_LOCAL=1`.
 - `TELEGRAM_REQUEST_TIMEOUT` - request timeout for the local API server. Keep it
   high for large PDF uploads.
+
+## Admin panel and limits
+
+Set your numeric Telegram id in `ADMIN_IDS`, restart the bot, then send
+`/admin` to the bot. The panel shows weekly/total usage metrics, successful and
+failed operations, top users, and current limit settings.
+
+Weekly limits are counted by successful operations over the last 7 days. They
+apply to conversions and PDF tools such as merge, split, extract pages, and
+delete pages. Admin ids from `ADMIN_IDS` bypass the limits for testing and
+maintenance.
