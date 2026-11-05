@@ -1,0 +1,28 @@
+[project]
+name = "converter-bot"
+version = "2.0.0"
+description = "Telegram bot: files to PDF with OCR, PDF tools, archives, Telegram Stars payments"
+readme = "README.md"
+# 3.12 matches the Docker image; all dependencies have ready wheels for it.
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "aiogram[redis]==3.30.0",
+    "Pillow==10.4.0",
+    "pypdf==4.3.1",
+    "py7zr==0.22.0",
+    "rarfile==4.2",
+    "ocrmypdf>=16.5,<17",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+# This is an application, not a library: uv only manages the environment.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,25 +1,21 @@
-# macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-.Trashes
-.Spotlight-V100
-.TemporaryItems
-.fseventsd
-.DocumentRevisions-V100
-*.icloud
-
 # Python
 __pycache__/
 *.py[cod]
 .venv/
+.pytest_cache/
 
 # Local config and runtime data
 .env
-tmp/
+.env.*
+!.env.example
+data/
 *.log
 
-# Optional local fonts for better Office document rendering
+# Optional local fonts (not redistributable)
 fonts/*
 !fonts/.gitkeep
+
+# OS
+.DS_Store
+._*
+Thumbs.db

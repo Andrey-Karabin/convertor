@@ -1,62 +1,47 @@
 services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # These always point inside the container, whatever is in .env.
+      DATA_DIR: /app/data
+      WORK_DIR: /app/data/work
+      DB_PATH: /app/data/bot.sqlite3
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+    cpus: ${DOCKER_CPUS:-2}
+    volumes:
+      - bot-data:/app/data
+      - ./fonts:/usr/local/share/fonts/custom:ro
+      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    # appendonly: dialog state survives a Redis restart too
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redis-data:/data
+
+  # Optional local Bot API server: files up to 2000 MB instead of 20/50 MB.
+  # Turn on with COMPOSE_PROFILES=local-api in .env.
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
-    profiles:
-      - local-api
-    env_file:
-      - .env
+    profiles: ["local-api"]
+    restart: unless-stopped
     environment:
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:-}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-}
       TELEGRAM_LOCAL: "1"
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8081:8081"
     volumes:
       - telegram-bot-api-data:/var/lib/telegram-bot-api
 
-  bot:
-    build: .
-    cpus: ${DOCKER_CPUS:-12}
-    env_file:
-      - .env
-    environment:
-      OMP_NUM_THREADS: ${DOCKER_CPUS:-12}
-      OPENBLAS_NUM_THREADS: ${DOCKER_CPUS:-12}
-      MKL_NUM_THREADS: ${DOCKER_CPUS:-12}
-      NUMEXPR_NUM_THREADS: ${DOCKER_CPUS:-12}
-    restart: unless-stopped
-    volumes:
-      - convertor-work:/tmp/convertor
-      - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
-      - ./fonts:/usr/local/share/fonts/custom:ro
-
-  web:
-    build: .
-    profiles:
-      - web
-    command:
-      - streamlit
-      - run
-      - streamlit_app.py
-      - --server.address=0.0.0.0
-      - --server.port=8501
-      - --server.maxUploadSize=${STREAMLIT_MAX_UPLOAD_MB:-500}
-    cpus: ${DOCKER_CPUS:-12}
-    env_file:
-      - .env
-    environment:
-      OMP_NUM_THREADS: ${DOCKER_CPUS:-12}
-      OPENBLAS_NUM_THREADS: ${DOCKER_CPUS:-12}
-      MKL_NUM_THREADS: ${DOCKER_CPUS:-12}
-      NUMEXPR_NUM_THREADS: ${DOCKER_CPUS:-12}
-    restart: unless-stopped
-    ports:
-      - "${STREAMLIT_PORT:-8501}:8501"
-    volumes:
-      - convertor-work:/tmp/convertor
-      - ./fonts:/usr/local/share/fonts/custom:ro
-
 volumes:
-  convertor-work:
+  bot-data:
+  redis-data:
   telegram-bot-api-data:
